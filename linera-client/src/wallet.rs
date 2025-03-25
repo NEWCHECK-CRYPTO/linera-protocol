@@ -7,7 +7,7 @@ use std::{
 };
 
 use linera_base::{
-    crypto::{AccountSecretKey, CryptoHash, CryptoRng},
+    crypto::{CryptoHash, CryptoRng, SigningKey},
     data_types::{BlockHeight, Timestamp},
     ensure,
     identifiers::{AccountOwner, ChainDescription, ChainId},
@@ -23,16 +23,16 @@ use serde::{Deserialize, Serialize};
 use crate::{config::GenesisConfig, error, Error};
 
 #[derive(Serialize, Deserialize)]
-pub struct Wallet {
-    pub chains: BTreeMap<ChainId, UserChain>,
-    pub unassigned_key_pairs: HashMap<AccountOwner, AccountSecretKey>,
+pub struct Wallet<K> {
+    pub chains: BTreeMap<ChainId, UserChain<K>>,
+    pub unassigned_key_pairs: HashMap<AccountOwner, K>,
     pub default: Option<ChainId>,
     pub genesis_config: GenesisConfig,
     pub testing_prng_seed: Option<u64>,
 }
 
-impl Extend<UserChain> for Wallet {
-    fn extend<Chains: IntoIterator<Item = UserChain>>(&mut self, chains: Chains) {
+impl<K> Extend<UserChain<K>> for Wallet<K> {
+    fn extend<Chains: IntoIterator<Item = UserChain<K>>>(&mut self, chains: Chains) {
         let mut chains = chains.into_iter();
         if let Some(chain) = chains.next() {
             // Ensures that the default chain gets set appropriately to the first chain,
@@ -45,7 +45,7 @@ impl Extend<UserChain> for Wallet {
     }
 }
 
-impl Wallet {
+impl<K> Wallet<K> {
     pub fn new(genesis_config: GenesisConfig, testing_prng_seed: Option<u64>) -> Self {
         Wallet {
             chains: BTreeMap::new(),
@@ -56,11 +56,11 @@ impl Wallet {
         }
     }
 
-    pub fn get(&self, chain_id: ChainId) -> Option<&UserChain> {
+    pub fn get(&self, chain_id: ChainId) -> Option<&UserChain<K>> {
         self.chains.get(&chain_id)
     }
 
-    pub fn insert(&mut self, chain: UserChain) {
+    pub fn insert(&mut self, chain: UserChain<K>) {
         if self.default.is_none() {
             self.default = Some(chain.chain_id);
         }
@@ -68,7 +68,10 @@ impl Wallet {
         self.chains.insert(chain.chain_id, chain);
     }
 
-    pub fn forget_keys(&mut self, chain_id: &ChainId) -> Result<AccountSecretKey, Error> {
+    pub fn forget_keys(&mut self, chain_id: &ChainId) -> Result<K, Error>
+    where
+        K: SigningKey,
+    {
         let chain = self
             .chains
             .get_mut(chain_id)
@@ -79,7 +82,7 @@ impl Wallet {
             .ok_or(error::Inner::NonexistentKeypair(*chain_id).into())
     }
 
-    pub fn forget_chain(&mut self, chain_id: &ChainId) -> Result<UserChain, Error> {
+    pub fn forget_chain(&mut self, chain_id: &ChainId) -> Result<UserChain<K>, Error> {
         self.chains
             .remove(chain_id)
             .ok_or(error::Inner::NonexistentChain(*chain_id).into())
@@ -105,20 +108,26 @@ impl Wallet {
         self.chains.len()
     }
 
-    pub fn last_chain(&self) -> Option<&UserChain> {
+    pub fn last_chain(&self) -> Option<&UserChain<K>> {
         self.chains.values().last()
     }
 
-    pub fn chains_mut(&mut self) -> impl Iterator<Item = &mut UserChain> {
+    pub fn chains_mut(&mut self) -> impl Iterator<Item = &mut UserChain<K>> {
         self.chains.values_mut()
     }
 
-    pub fn add_unassigned_key_pair(&mut self, key_pair: AccountSecretKey) {
+    pub fn add_unassigned_key_pair(&mut self, key_pair: K)
+    where
+        K: SigningKey,
+    {
         let owner = key_pair.public().into();
         self.unassigned_key_pairs.insert(owner, key_pair);
     }
 
-    pub fn key_pair_for_owner(&self, owner: &AccountOwner) -> Option<AccountSecretKey> {
+    pub fn key_pair_for_owner(&self, owner: &AccountOwner) -> Option<K>
+    where
+        K: SigningKey,
+    {
         if let Some(key_pair) = self
             .unassigned_key_pairs
             .get(owner)
@@ -128,7 +137,7 @@ impl Wallet {
         }
         self.chains
             .values()
-            .filter_map(|user_chain| user_chain.key_pair.as_ref())
+            .filter_map(|user_chain| user_chain.key_pair)
             .find(|key_pair| AccountOwner::from(key_pair.public()) == *owner)
             .map(|key_pair| key_pair.copy())
     }
@@ -164,12 +173,13 @@ impl Wallet {
         Ok(())
     }
 
-    pub async fn update_from_state<P, S>(&mut self, chain_client: &ChainClient<P, S>)
+    pub async fn update_from_state<P, S>(&mut self, chain_client: &ChainClient<P, S, K>)
     where
         P: ValidatorNodeProvider + Sync + 'static,
         S: Storage + Clone + Send + Sync + 'static,
+        K: SigningKey + Send + Sync + 'static,
     {
-        let key_pair = chain_client.key_pair().await.map(|k| k.copy()).ok();
+        let key_pair = chain_client.key_pair().await.ok();
         let state = chain_client.state();
         self.chains.insert(
             chain_client.chain_id(),
@@ -204,20 +214,20 @@ impl Wallet {
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct UserChain {
+pub struct UserChain<K> {
     pub chain_id: ChainId,
-    pub key_pair: Option<AccountSecretKey>,
+    pub key_pair: Option<K>,
     pub block_hash: Option<CryptoHash>,
     pub timestamp: Timestamp,
     pub next_block_height: BlockHeight,
     pub pending_proposal: Option<PendingProposal>,
 }
 
-impl Clone for UserChain {
+impl<K> Clone for UserChain<K> {
     fn clone(&self) -> Self {
         Self {
             chain_id: self.chain_id,
-            key_pair: self.key_pair.as_ref().map(AccountSecretKey::copy),
+            key_pair: self.key_pair.clone(),
             block_hash: self.block_hash,
             timestamp: self.timestamp,
             next_block_height: self.next_block_height,
@@ -226,13 +236,9 @@ impl Clone for UserChain {
     }
 }
 
-impl UserChain {
+impl<K> UserChain<K> {
     /// Create a user chain that we own.
-    pub fn make_initial(
-        key_pair: AccountSecretKey,
-        description: ChainDescription,
-        timestamp: Timestamp,
-    ) -> Self {
+    pub fn make_initial(key_pair: K, description: ChainDescription, timestamp: Timestamp) -> Self {
         Self {
             chain_id: description.into(),
             key_pair: Some(key_pair),

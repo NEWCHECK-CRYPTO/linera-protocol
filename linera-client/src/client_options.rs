@@ -10,7 +10,7 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use linera_base::{
-    crypto::{AccountPublicKey, CryptoHash, ValidatorPublicKey},
+    crypto::{AccountPublicKey, AccountSecretKey, CryptoHash, SigningKey, ValidatorPublicKey},
     data_types::{Amount, ApplicationPermissions, TimeDelta},
     identifiers::{Account, AccountOwner, ApplicationId, ChainId, MessageId, ModuleId},
     ownership::{ChainOwnership, TimeoutConfig},
@@ -20,6 +20,7 @@ use linera_base::{
 use linera_core::{client::BlanketMessagePolicy, DEFAULT_GRACE_PERIOD};
 use linera_execution::{ResourceControlPolicy, WasmRuntime, WithWasmDefault as _};
 use linera_views::{lru_caching::StorageCacheConfig, store::CommonStoreConfig};
+use serde::{de::DeserializeOwned, Serialize};
 
 #[cfg(feature = "fs")]
 use crate::config::GenesisConfig;
@@ -210,7 +211,11 @@ impl ClientOptions {
     }
 
     pub async fn run_with_storage<R: Runnable>(&self, job: R) -> Result<R::Output, Error> {
-        let genesis_config = self.wallet().await?.genesis_config().clone();
+        let genesis_config = self
+            .wallet::<AccountSecretKey>()
+            .await?
+            .genesis_config()
+            .clone();
         let output = Box::pin(run_with_storage(
             self.storage_config()?
                 .add_common_config(self.common_config())
@@ -248,7 +253,7 @@ impl ClientOptions {
     }
 
     pub async fn initialize_storage(&self) -> Result<(), Error> {
-        let wallet = self.wallet().await?;
+        let wallet = self.wallet::<AccountSecretKey>().await?;
         full_initialize_storage(
             self.storage_config()?
                 .add_common_config(self.common_config())
@@ -262,7 +267,9 @@ impl ClientOptions {
 
 #[cfg(feature = "fs")]
 impl ClientOptions {
-    pub async fn wallet(&self) -> Result<WalletState<persistent::File<Wallet>>, Error> {
+    pub async fn wallet<K: Serialize + DeserializeOwned>(
+        &self,
+    ) -> Result<WalletState<persistent::File<Wallet<K>>>, Error> {
         let wallet = persistent::File::read(&self.wallet_path()?)?;
         Ok(WalletState::new(wallet))
     }
@@ -285,11 +292,11 @@ impl ClientOptions {
         Ok(config_dir)
     }
 
-    pub fn create_wallet(
+    pub fn create_wallet<K: SigningKey + Serialize + DeserializeOwned>(
         &self,
         genesis_config: GenesisConfig,
         testing_prng_seed: Option<u64>,
-    ) -> Result<WalletState<persistent::File<Wallet>>, Error> {
+    ) -> Result<WalletState<persistent::File<Wallet<K>>>, Error> {
         let wallet_path = self.wallet_path()?;
         if wallet_path.exists() {
             return Err(Error::WalletAlreadyExists(wallet_path));

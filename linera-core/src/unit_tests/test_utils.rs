@@ -20,7 +20,7 @@ use linera_base::{
         AccountPublicKey, AccountSecretKey, CryptoHash, ValidatorKeypair, ValidatorPublicKey,
     },
     data_types::*,
-    identifiers::{BlobId, ChainDescription, ChainId},
+    identifiers::{AccountOwner, BlobId, ChainDescription, ChainId},
 };
 use linera_chain::{
     data_types::BlockProposal,
@@ -50,7 +50,7 @@ use {
 };
 
 use crate::{
-    client::{ChainClient, Client},
+    client::{ChainClient, Client, SigningKeys},
     data_types::*,
     node::{
         CrossChainMessageDelivery, NodeError, NotificationStream, ValidatorNode,
@@ -803,7 +803,8 @@ where
         &mut self,
         index: u32,
         balance: Amount,
-    ) -> Result<ChainClient<NodeProvider<B::Storage>, B::Storage>, anyhow::Error> {
+    ) -> Result<ChainClient<NodeProvider<B::Storage>, B::Storage, AccountSecretKey>, anyhow::Error>
+    {
         // Make sure the admin chain is initialized.
         if self.genesis_storage_builder.accounts.is_empty() && index != 0 {
             Box::pin(self.add_root_chain(0, Amount::ZERO)).await?;
@@ -903,7 +904,8 @@ where
         key_pair: AccountSecretKey,
         block_hash: Option<CryptoHash>,
         block_height: BlockHeight,
-    ) -> Result<ChainClient<NodeProvider<B::Storage>, B::Storage>, anyhow::Error> {
+    ) -> Result<ChainClient<NodeProvider<B::Storage>, B::Storage, AccountSecretKey>, anyhow::Error>
+    {
         // Note that new clients are only given the genesis store: they must figure out
         // the rest by asking validators.
         let storage = self.make_storage().await?;
@@ -921,9 +923,17 @@ where
             DEFAULT_GRACE_PERIOD,
             Duration::from_secs(1),
         ));
+
+        let known_key_pairs = InMemSigningKeys(
+            vec![key_pair]
+                .into_iter()
+                .map(|key| (AccountOwner::from(key.public()), key))
+                .collect(),
+        );
+
         Ok(builder.create_chain_client(
             chain_id,
-            vec![key_pair],
+            Box::new(known_key_pairs),
             self.admin_id,
             block_hash,
             Timestamp::from(0),
@@ -1003,6 +1013,21 @@ where
             let chain = guard.state.chain_state_view(chain_id).await.unwrap();
             assert_eq!(chain.outboxes.indices().await.unwrap(), []);
         }
+    }
+}
+
+pub struct InMemSigningKeys(BTreeMap<AccountOwner, AccountSecretKey>);
+impl SigningKeys<AccountSecretKey> for InMemSigningKeys {
+    fn get(&self, owner: &AccountOwner) -> Option<AccountSecretKey> {
+        self.0.get(owner).map(|key| key.copy())
+    }
+
+    fn insert(&mut self, owner: AccountOwner, key: AccountSecretKey) {
+        self.0.insert(owner, key);
+    }
+
+    fn contains_key(&self, owner: &AccountOwner) -> bool {
+        self.0.contains_key(owner)
     }
 }
 

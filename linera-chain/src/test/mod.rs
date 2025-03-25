@@ -6,7 +6,7 @@
 mod http_server;
 
 use linera_base::{
-    crypto::{AccountPublicKey, AccountSecretKey},
+    crypto::{AccountPublicKey, SigningKey},
     data_types::{Amount, BlockHeight, Round, Timestamp},
     hashed::Hashed,
     identifiers::{AccountOwner, ChainId},
@@ -81,12 +81,12 @@ pub trait BlockTestExt: Sized {
 
     /// Returns a block proposal in the first round in a default ownership configuration
     /// (`Round::MultiLeader(0)`) without any hashed certificate values or validated block.
-    fn into_first_proposal(self, key_pair: &AccountSecretKey) -> BlockProposal {
+    fn into_first_proposal<T: SigningKey>(self, key_pair: T) -> BlockProposal {
         self.into_proposal_with_round(key_pair, Round::MultiLeader(0))
     }
 
     /// Returns a block proposal without any hashed certificate values or validated block.
-    fn into_proposal_with_round(self, key_pair: &AccountSecretKey, round: Round) -> BlockProposal;
+    fn into_proposal_with_round<T: SigningKey>(self, key_pair: T, round: Round) -> BlockProposal;
 }
 
 impl BlockTestExt for ProposedBlock {
@@ -127,7 +127,7 @@ impl BlockTestExt for ProposedBlock {
         self
     }
 
-    fn into_proposal_with_round(self, key_pair: &AccountSecretKey, round: Round) -> BlockProposal {
+    fn into_proposal_with_round<T: SigningKey>(self, key_pair: T, round: Round) -> BlockProposal {
         BlockProposal::new_initial(round, self, key_pair)
     }
 }

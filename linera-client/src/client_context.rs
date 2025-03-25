@@ -8,7 +8,7 @@ use std::{collections::HashSet, sync::Arc};
 use async_trait::async_trait;
 use futures::Future;
 use linera_base::{
-    crypto::{AccountSecretKey, CryptoHash, ValidatorPublicKey},
+    crypto::{CryptoHash, SigningKey, ValidatorPublicKey},
     data_types::{BlockHeight, Timestamp},
     identifiers::{Account, AccountOwner, ChainId, MessageId},
     ownership::ChainOwnership,
@@ -16,7 +16,9 @@ use linera_base::{
 };
 use linera_chain::types::ConfirmedBlockCertificate;
 use linera_core::{
-    client::{BlanketMessagePolicy, ChainClient, Client, MessagePolicy, PendingProposal},
+    client::{
+        BlanketMessagePolicy, ChainClient, Client, MessagePolicy, PendingProposal, SigningKeys,
+    },
     data_types::{ChainInfoQuery, ClientOutcome},
     join_set_ext::JoinSet,
     node::{CrossChainMessageDelivery, ValidatorNodeProvider},
@@ -64,12 +66,13 @@ use crate::{
     Error,
 };
 
-pub struct ClientContext<Storage, W>
+pub struct ClientContext<Storage, W, Key>
 where
     Storage: linera_storage::Storage,
+    Key: linera_base::crypto::SigningKey,
 {
     pub wallet: WalletState<W>,
-    pub client: Arc<Client<NodeProvider, Storage>>,
+    pub client: Arc<Client<NodeProvider, Storage, Key>>,
     pub send_timeout: Duration,
     pub recv_timeout: Duration,
     pub retry_delay: Duration,
@@ -81,26 +84,31 @@ where
 
 #[cfg_attr(not(web), async_trait)]
 #[cfg_attr(web, async_trait(?Send))]
-impl<S, W> chain_listener::ClientContext for ClientContext<S, W>
+impl<S, W, K> chain_listener::ClientContext for ClientContext<S, W, K>
 where
     S: Storage + Clone + Send + Sync + 'static,
-    W: Persist<Target = Wallet> + 'static,
+    W: Persist<Target = Wallet<K>> + 'static,
+    K: SigningKey + Sync + Send + 'static,
 {
     type ValidatorNodeProvider = NodeProvider;
     type Storage = S;
+    type Key = K;
 
-    fn wallet(&self) -> &Wallet {
+    fn wallet(&self) -> &Wallet<K> {
         &self.wallet
     }
 
-    fn make_chain_client(&self, chain_id: ChainId) -> Result<ChainClient<NodeProvider, S>, Error> {
+    fn make_chain_client(
+        &self,
+        chain_id: ChainId,
+    ) -> Result<ChainClient<NodeProvider, S, K>, Error> {
         self.make_chain_client(chain_id)
     }
 
     async fn update_wallet_for_new_chain(
         &mut self,
         chain_id: ChainId,
-        key_pair: Option<AccountSecretKey>,
+        key_pair: Option<K>,
         timestamp: Timestamp,
     ) -> Result<(), Error> {
         self.update_wallet_for_new_chain(chain_id, key_pair, timestamp)
@@ -108,18 +116,22 @@ where
         self.save_wallet().await
     }
 
-    async fn update_wallet(&mut self, client: &ChainClient<NodeProvider, S>) -> Result<(), Error> {
+    async fn update_wallet(
+        &mut self,
+        client: &ChainClient<NodeProvider, S, K>,
+    ) -> Result<(), Error> {
         self.update_wallet_from_client(client).await
     }
 }
 
-impl<S, W> ClientContext<S, W>
+impl<S, W, K> ClientContext<S, W, K>
 where
     S: Storage + Clone + Send + Sync + 'static,
-    W: Persist<Target = Wallet>,
+    W: Persist<Target = Wallet<K>>,
+    K: SigningKey + Send + Sync + 'static,
 {
     /// Returns a reference to the wallet.
-    pub fn wallet(&self) -> &Wallet {
+    pub fn wallet(&self) -> &Wallet<K> {
         &self.wallet
     }
 
@@ -130,7 +142,7 @@ where
 
     pub async fn mutate_wallet<R: Send>(
         &mut self,
-        mutation: impl FnOnce(&mut Wallet) -> R + Send,
+        mutation: impl FnOnce(&mut Wallet<K>) -> R + Send,
     ) -> Result<R, Error> {
         self.wallet
             .mutate(mutation)
@@ -240,7 +252,10 @@ where
             .expect("No chain specified in wallet with no default chain")
     }
 
-    fn make_chain_client(&self, chain_id: ChainId) -> Result<ChainClient<NodeProvider, S>, Error> {
+    fn make_chain_client(
+        &self,
+        chain_id: ChainId,
+    ) -> Result<ChainClient<NodeProvider, S, K>, Error> {
         // We only create clients for chains we have in the wallet, or for the admin chain.
         let chain = match self.wallet.get(chain_id) {
             Some(chain) => chain.clone(),
@@ -263,12 +278,12 @@ where
     fn make_chain_client_internal(
         &self,
         chain_id: ChainId,
-        known_key_pairs: Vec<AccountSecretKey>,
+        known_key_pairs: Box<dyn SigningKeys<K>>,
         block_hash: Option<CryptoHash>,
         timestamp: Timestamp,
         next_block_height: BlockHeight,
         pending_proposal: Option<PendingProposal>,
-    ) -> ChainClient<NodeProvider, S> {
+    ) -> ChainClient<NodeProvider, S, K> {
         let mut chain_client = self.client.create_chain_client(
             chain_id,
             known_key_pairs,
@@ -307,7 +322,7 @@ where
 
     pub async fn update_wallet_from_client(
         &mut self,
-        client: &ChainClient<NodeProvider, S>,
+        client: &ChainClient<NodeProvider, S, K>,
     ) -> Result<(), Error> {
         self.wallet.as_mut().update_from_state(client).await;
         self.save_wallet().await
@@ -317,7 +332,7 @@ where
     pub async fn update_wallet_for_new_chain(
         &mut self,
         chain_id: ChainId,
-        key_pair: Option<AccountSecretKey>,
+        key_pair: Option<K>,
         timestamp: Timestamp,
     ) -> Result<(), Error> {
         self.update_wallet_for_new_chain_internal(chain_id, key_pair, timestamp)
@@ -327,14 +342,14 @@ where
     async fn update_wallet_for_new_chain_internal(
         &mut self,
         chain_id: ChainId,
-        key_pair: Option<AccountSecretKey>,
+        key_pair: Option<K>,
         timestamp: Timestamp,
     ) -> Result<(), Error> {
         if self.wallet.get(chain_id).is_none() {
             self.mutate_wallet(|w| {
                 w.insert(UserChain {
                     chain_id,
-                    key_pair: key_pair.as_ref().map(|kp| kp.copy()),
+                    key_pair,
                     block_hash: None,
                     timestamp,
                     next_block_height: BlockHeight::ZERO,
@@ -349,7 +364,7 @@ where
 
     pub async fn process_inbox(
         &mut self,
-        chain_client: &ChainClient<NodeProvider, S>,
+        chain_client: &ChainClient<NodeProvider, S, K>,
     ) -> Result<Vec<ConfirmedBlockCertificate>, Error> {
         let mut certificates = Vec::new();
         // Try processing the inbox optimistically without waiting for validator notifications.
@@ -477,11 +492,11 @@ where
     /// timeout, it will wait and retry.
     pub async fn apply_client_command<E, F, Fut, T>(
         &mut self,
-        client: &ChainClient<NodeProvider, S>,
+        client: &ChainClient<NodeProvider, S, K>,
         mut f: F,
     ) -> Result<T, Error>
     where
-        F: FnMut(&ChainClient<NodeProvider, S>) -> Fut,
+        F: FnMut(&ChainClient<NodeProvider, S, K>) -> Fut,
         Fut: Future<Output = Result<ClientOutcome<T>, E>>,
         Error: From<E>,
     {
@@ -543,14 +558,15 @@ where
 }
 
 #[cfg(feature = "fs")]
-impl<S, W> ClientContext<S, W>
+impl<S, W, K> ClientContext<S, W, K>
 where
     S: Storage + Clone + Send + Sync + 'static,
-    W: Persist<Target = Wallet>,
+    W: Persist<Target = Wallet<K>>,
+    K: SigningKey + Send + Sync + 'static,
 {
     pub async fn publish_module(
         &mut self,
-        chain_client: &ChainClient<NodeProvider, S>,
+        chain_client: &ChainClient<NodeProvider, S, K>,
         contract: PathBuf,
         service: PathBuf,
         vm_runtime: VmRuntime,
@@ -589,7 +605,7 @@ where
 
     pub async fn publish_data_blob(
         &mut self,
-        chain_client: &ChainClient<NodeProvider, S>,
+        chain_client: &ChainClient<NodeProvider, S, K>,
         blob_path: PathBuf,
     ) -> Result<CryptoHash, Error> {
         info!("Loading data blob file");
@@ -618,7 +634,7 @@ where
     // TODO(#2490): Consider removing or renaming this.
     pub async fn read_data_blob(
         &mut self,
-        chain_client: &ChainClient<NodeProvider, S>,
+        chain_client: &ChainClient<NodeProvider, S, K>,
         hash: CryptoHash,
     ) -> Result<(), Error> {
         info!("Verifying data blob");
@@ -639,10 +655,11 @@ where
 }
 
 #[cfg(feature = "benchmark")]
-impl<S, W> ClientContext<S, W>
+impl<S, W, K> ClientContext<S, W, K>
 where
     S: Storage + Clone + Send + Sync + 'static,
-    W: Persist<Target = Wallet>,
+    W: Persist<Target = Wallet<K>>,
+    K: SigningKey + Send + Sync + 'static,
 {
     pub async fn prepare_for_benchmark(
         &mut self,
@@ -652,7 +669,7 @@ where
         fungible_application_id: Option<ApplicationId>,
     ) -> Result<
         (
-            HashMap<ChainId, ChainClient<NodeProvider, S>>,
+            HashMap<ChainId, ChainClient<NodeProvider, S, K>>,
             Epoch,
             Vec<(ChainId, Vec<Operation>, AccountSecretKey)>,
             Committee,
@@ -737,7 +754,7 @@ where
     }
 
     async fn process_inbox_without_updating_wallet(
-        chain_client: &ChainClient<NodeProvider, S>,
+        chain_client: &ChainClient<NodeProvider, S, K>,
     ) -> Result<Vec<ConfirmedBlockCertificate>, Error> {
         // Try processing the inbox optimistically without waiting for validator notifications.
         chain_client.synchronize_from_validators().await?;
@@ -759,7 +776,7 @@ where
     ) -> Result<
         (
             HashMap<ChainId, AccountSecretKey>,
-            HashMap<ChainId, ChainClient<NodeProvider, S>>,
+            HashMap<ChainId, ChainClient<NodeProvider, S, K>>,
         ),
         Error,
     > {
@@ -869,7 +886,7 @@ where
 
     async fn execute_open_chains_operations(
         num_new_chains: usize,
-        chain_client: &ChainClient<NodeProvider, S>,
+        chain_client: &ChainClient<NodeProvider, S, K>,
         balance: Amount,
         key_pair: &AccountSecretKey,
         admin_id: ChainId,

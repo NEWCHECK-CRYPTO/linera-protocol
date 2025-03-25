@@ -10,7 +10,7 @@ use std::{
 use async_trait::async_trait;
 use futures::{lock::Mutex, stream, StreamExt};
 use linera_base::{
-    crypto::AccountSecretKey,
+    crypto::SigningKey,
     data_types::Timestamp,
     identifiers::{ChainId, Destination},
 };
@@ -52,23 +52,27 @@ pub struct ChainListenerConfig {
     pub delay_after_ms: u64,
 }
 
-type ContextChainClient<C> =
-    ChainClient<<C as ClientContext>::ValidatorNodeProvider, <C as ClientContext>::Storage>;
+type ContextChainClient<C> = ChainClient<
+    <C as ClientContext>::ValidatorNodeProvider,
+    <C as ClientContext>::Storage,
+    <C as ClientContext>::Key,
+>;
 
 #[cfg_attr(not(web), async_trait, trait_variant::make(Send))]
 #[cfg_attr(web, async_trait(?Send))]
 pub trait ClientContext: 'static {
     type ValidatorNodeProvider: ValidatorNodeProvider + Sync;
     type Storage: Storage + Clone + Send + Sync + 'static;
+    type Key: SigningKey + Sync + Send;
 
-    fn wallet(&self) -> &Wallet;
+    fn wallet(&self) -> &Wallet<Self::Key>;
 
     fn make_chain_client(&self, chain_id: ChainId) -> Result<ContextChainClient<Self>, Error>;
 
     async fn update_wallet_for_new_chain(
         &mut self,
         chain_id: ChainId,
-        key_pair: Option<AccountSecretKey>,
+        key_pair: Option<Self::Key>,
         timestamp: Timestamp,
     ) -> Result<(), Error>;
 
