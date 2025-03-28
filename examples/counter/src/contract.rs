@@ -78,13 +78,22 @@ mod tests {
 
     use super::{Counter, CounterContract};
 
+    // ANCHOR: counter_test
     #[test]
     fn operation() {
         let initial_value = 72_u64;
-        let mut counter = create_and_instantiate_counter(initial_value);
+        let runtime = ContractRuntime::new().with_application_parameters(());
+        let state = Counter::load(runtime.root_view_storage_context())
+            .blocking_wait()
+            .expect("Failed to read from mock key value store");
+        let mut contract = CounterContract { state, runtime };
+
+        let mut counter = contract
+            .instantiate(initial_value)
+            .now_or_never()
+            .expect("Initialization of counter state should not await anything");
 
         let increment = 42_308_u64;
-
         let response = counter
             .execute_operation(increment)
             .now_or_never()
@@ -95,6 +104,7 @@ mod tests {
         assert_eq!(response, expected_value);
         assert_eq!(*counter.state.value.get(), initial_value + increment);
     }
+    // ANCHOR_END: counter_test
 
     #[test]
     #[should_panic(expected = "Counter application doesn't support any cross-chain messages")]
